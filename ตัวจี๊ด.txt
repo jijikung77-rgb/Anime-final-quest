@@ -1,0 +1,808 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+
+local player = Players.LocalPlayer
+local character, humanoidRootPart, humanoid
+
+-- ฟังก์ชันอัพเดทตัวละคร
+local function updateCharacter()
+    character = player.Character or player.CharacterAdded:Wait()
+    humanoidRootPart = character:WaitForChild("HumanoidRootPart")
+    humanoid = character:WaitForChild("Humanoid")
+    return character, humanoidRootPart, humanoid
+end
+
+updateCharacter()
+
+-- ==============================
+-- RAYFIELD UI LIBRARY
+-- ==============================
+local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+
+local Window = Rayfield:CreateWindow({
+    Name = "⚡ Anime Final Quest ⚡",
+    LoadingTitle = "Loading Anime Final Quest...",
+    LoadingSubtitle = "Beta3",
+    ConfigurationSaving = {
+        Enabled = true,
+        FolderName = "AnimeFinalQuest",
+        FileName = "Config"
+    },
+    Discord = {
+        Enabled = false,
+        Invite = "noinvitelink",
+        RememberJoins = false
+    },
+    KeySystem = false
+})
+
+local MainTab = Window:CreateTab("⚔️ Main", 4483362458)
+local SkillTab = Window:CreateTab("🔥 Skills", 4483362458)
+local SafetyTab = Window:CreateTab("🛡️ Safety", 4483362458)
+local SettingsTab = Window:CreateTab("⚙️ Settings", 4483362458)
+
+-- ==============================
+-- VARIABLES & CONFIG
+-- ==============================
+local isRunning = false
+local isAutoReplay = false
+local isHitAndRun = false
+local isRetreating = false
+local damageMultiplier = 1
+local isAutoSkill = false
+local selectedSkillKey = "1" -- legacy/สำหรับ dropdown skill เดียว
+local isAutoUltimate = false
+local isSafeMode = false
+local safeModeCooldown = false
+
+local currentTarget = nil
+local attackLoop = nil
+local floatConnection = nil
+local hitRunTask = nil
+local animationMonitor = {}
+local golemMonitorTask = nil
+local autoSkillTask = nil
+local autoUltimateTask = nil
+local healthMonitorTask = nil
+local priorityCheckTask = nil
+
+local lastHealth = 0
+
+local attackHeightMax = 19
+local hitRunHealthThreshold = 600
+
+-- Demon King (เฉพาะ)
+local demonKingSafeAnimations = {"idle", "walk", "run", "gethit", "gethit1", "gethit2", "gethit3", "gethit4", "gethit5"}
+local demonKingDangerKeywords = {"attack", "slam", "smash", "skill1", "skill2", "skill3", "skill4", "skill5", "hit1", "hit3", "hit4", "hit5", "hit", "hit2"}
+
+-- Boss ปกติ (golem, spider)
+local bossSafeAnimations = {"idle", "walk", "run", "gethit", "gethit1", "gethit2", "gethit3", "gethit4", "gethit5", "hit", "hit2", "Hit", "Hit2"}
+local bossDangerKeywords = {"skill", "skill1", "skill2", "skill3", "skill4", "skill5"}
+
+local bossRetreatDurationDefault = 3
+local bossRetreatDurationHit = 1
+local bossRetreatDurationSkill = 3
+
+local golemNames = {"golem"}
+local spiderNames = {"spider"}
+local demonKingNames = {"demon king", "demonking"}
+local bossNames = {"golem", "spider", "demon king", "demonking", "demon", "king"}
+
+local safeModeHealthThreshold = 120
+local safeModeHealthDrop = 80
+local safeModeDuration = 30
+
+local blacklistedNames = {"dummy", "helicopter", "heli"}
+
+-- ==============================
+-- UI ELEMENTS
+-- ==============================
+
+local StatusLabel = MainTab:CreateLabel("Status: Idle")
+
+local AutoKillToggle = MainTab:CreateToggle({
+    Name = "🎯 Auto Kill",
+    CurrentValue = false,
+    Flag = "AutoKillToggle",
+    Callback = function(Value)
+        isRunning = Value
+        if isRunning then
+            StatusLabel:Set("Status: ✅ Running")
+            task.spawn(mainLoop)
+        else
+            StatusLabel:Set("Status: 🛑 Stopped")
+            if attackLoop then task.cancel(attackLoop) end
+            if hitRunTask then task.cancel(hitRunTask) end
+            if golemMonitorTask then task.cancel(golemMonitorTask) end
+            if autoSkillTask then task.cancel(autoSkillTask) end
+            if autoUltimateTask then task.cancel(autoUltimateTask) end
+            if healthMonitorTask then task.cancel(healthMonitorTask) end
+            if priorityCheckTask then task.cancel(priorityCheckTask) end
+            if floatConnection then floatConnection:Disconnect() end
+            
+            for model, conn in pairs(animationMonitor) do
+                conn:Disconnect()
+            end
+            animationMonitor = {}
+            
+            currentTarget = nil
+            isRetreating = false
+        end
+    end,
+})
+
+local HitRunToggle = MainTab:CreateToggle({
+    Name = "🏃 Hit & Run (>600 HP)",
+    CurrentValue = false,
+    Flag = "HitRunToggle",
+    Callback = function(Value)
+        isHitAndRun = Value
+    end,
+})
+
+local DmgSlider = MainTab:CreateSlider({
+    Name = "💥 Damage Multiplier",
+    Range = {1, 10},
+    Increment = 1,
+    Suffix = "x",
+    CurrentValue = 1,
+    Flag = "DmgMultiplier",
+    Callback = function(Value)
+        damageMultiplier = Value
+    end,
+})
+
+local AutoSkillToggle = SkillTab:CreateToggle({
+    Name = "🔥 Auto Skill",
+    CurrentValue = false,
+    Flag = "AutoSkillToggle",
+    Callback = function(Value)
+        isAutoSkill = Value
+        if isAutoSkill and isRunning then
+            autoSkillLoop()
+        else
+            stopAutoSkillLoop()
+        end
+    end,
+})
+
+local SkillKeyDropdown = SkillTab:CreateDropdown({
+    Name = "⌨️ Skill Key [ไม่จำเป็น เมื่อใช้ AutoMultiSkill]",
+    Options = {"1", "2", "3", "4", "F", "X"},
+    CurrentOption = {"1"},
+    MultipleOptions = false,
+    Flag = "SkillKey",
+    Callback = function(Option)
+        selectedSkillKey = Option[1]
+    end,
+})
+
+SkillTab:CreateLabel("Skills: 1, 2, 3, 4, F, X")
+
+local AutoUltimateToggle = SkillTab:CreateToggle({
+    Name = "🛡️ Safe Mode",
+    CurrentValue = false,
+    Flag = "SafeMode",
+    Callback = function(Value)
+        isSafeMode = Value
+        if isSafeMode and isRunning then
+            healthMonitorLoop()
+        else
+            if healthMonitorTask then 
+                task.cancel(healthMonitorTask)
+                healthMonitorTask = nil
+            end
+        end
+    end,
+})
+
+SafetyTab:CreateLabel("Escapes for 30s when HP < 120 or drops > 80")
+
+SafetyTab:CreateButton({
+    Name = "🚨 Emergency Escape NOW",
+    Callback = function()
+        emergencyEscape()
+    end,
+})
+
+local AutoReplayToggle = SettingsTab:CreateToggle({
+    Name = "🔄 Auto Replay",
+    CurrentValue = false,
+    Flag = "AutoReplay",
+    Callback = function(Value)
+        isAutoReplay = Value
+        if isAutoReplay then
+            task.spawn(autoReplayLogic)
+        end
+    end,
+})
+
+SettingsTab:CreateButton({
+    Name = "💾 Save Config",
+    Callback = function()
+        Rayfield:Notify({
+            Title = "Config Saved",
+            Content = "Your settings have been saved",
+            Duration = 3,
+            Image = 4483362458,
+        })
+    end,
+})
+
+SettingsTab:CreateButton({
+    Name = "🗑️ Clear Connections",
+    Callback = function()
+        for model, conn in pairs(animationMonitor) do
+            conn:Disconnect()
+        end
+        animationMonitor = {}
+        Rayfield:Notify({
+            Title = "Cleared",
+            Content = "All animation monitors cleared",
+            Duration = 2,
+            Image = 4483362458,
+        })
+    end,
+})
+
+-- ==============================
+-- 🎮 VIRTUAL INPUT FUNCTIONS
+-- ==============================
+local function pressKey(key)
+    local keyMap = {
+        ["1"] = Enum.KeyCode.One,
+        ["2"] = Enum.KeyCode.Two,
+        ["3"] = Enum.KeyCode.Three,
+        ["4"] = Enum.KeyCode.Four,
+        ["F"] = Enum.KeyCode.F,
+        ["X"] = Enum.KeyCode.X,
+        ["G"] = Enum.KeyCode.G
+    }
+    
+    local keyCode = keyMap[key]
+    
+    if keyCode then
+        pcall(function()
+            VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
+            task.wait(0.05)
+            VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
+        end)
+    end
+end
+
+-- ==============================
+-- 🔥 AUTO SKILL SYSTEM (MULTI-KEY + เฉพาะตอนสู้)
+-- ==============================
+
+local keysToPress = {"1", "2", "3", "F", "X"}
+local pressInterval = 0.5 -- วินาที
+local loopDelay = 3 -- วินาที
+
+local autoSkillLoopTask = nil
+local isAutoSkillLooping = false
+
+function autoSkillLoop()
+    stopAutoSkillLoop()
+    isAutoSkillLooping = true
+    autoSkillLoopTask = task.spawn(function()
+        while isAutoSkill and isRunning and isAutoSkillLooping do
+            if not isRetreating and currentTarget then
+                -- กดวนแต่ละปุ่มใน keysToPress
+                for _, key in ipairs(keysToPress) do
+                    if not isAutoSkill or not isRunning or not isAutoSkillLooping then break end
+                    if not isRetreating and currentTarget then
+                        pressKey(key)
+                    end
+                    -- หลังจากแต่ละปุ่ม รอ pressInterval
+                    task.wait(pressInterval)
+                end
+                -- หลังจากครบชุด รอ loopDelay
+                if isAutoSkill and isRunning and not isRetreating then
+                    task.wait(loopDelay)
+                end
+            else
+                -- ถ้ากำลัง retreat หรือ currentTarget หาย ให้รอจนจบสถานะหนีนั้น
+                task.wait(0.25)
+            end
+        end
+    end)
+end
+
+function stopAutoSkillLoop()
+    isAutoSkillLooping = false
+    if autoSkillLoopTask then
+        task.cancel(autoSkillLoopTask)
+        autoSkillLoopTask = nil
+    end
+end
+
+-- ==============================
+-- 🎲 RANDOM ESCAPE POSITION
+-- ==============================
+local function getRandomEscapePosition(enemyPos)
+    local randomX = math.random(400, 500) * (math.random(0, 1) == 0 and -1 or 1)
+    local randomY = math.random(400, 500)
+    local randomZ = math.random(400, 500) * (math.random(0, 1) == 0 and -1 or 1)
+    return enemyPos + Vector3.new(randomX, randomY, randomZ)
+end
+
+local function retreatMovementLoop(duration)
+    local startTime = tick()
+    local lastPosition = Vector3.new(0, 0, 0)
+
+    while isRetreating and (tick() - startTime < duration) do
+        if not humanoidRootPart then break end
+
+        local enemyPos = currentTarget and currentTarget:FindFirstChild("HumanoidRootPart") and currentTarget.HumanoidRootPart.Position or humanoidRootPart.Position
+        local randomX = math.random(200, 400) * (math.random(0, 1) == 0 and -1 or 1)
+        local randomY = math.random(200, 300)
+        local randomZ = math.random(200, 400) * (math.random(0, 1) == 0 and -1 or 1)
+
+        local newPos = enemyPos + Vector3.new(randomX, randomY, randomZ)
+        if (newPos - lastPosition).Magnitude > 50 then
+            humanoidRootPart.CFrame = CFrame.new(newPos)
+            humanoidRootPart.Velocity = Vector3.new(0,0,0)
+            lastPosition = newPos
+        end
+        task.wait(0.5)
+    end
+    if isRetreating then
+        isRetreating = false
+        StatusLabel:Set("✅ Safe - Resume attack")
+    end
+end
+
+-- เช็คชื่อ Demon King
+local function isDemonKing(name)
+    name = string.lower(name)
+    for _, v in pairs(demonKingNames) do
+        if string.find(name, v) then
+            return true
+        end
+    end
+    return false
+end
+
+local function isBoss(modelName)
+    local lowerName = string.lower(modelName)
+    for _, bossName in pairs(bossNames) do
+        if string.find(lowerName, bossName) then
+            return true
+        end
+    end
+    return false
+end
+
+local function isMageGoblin(modelName)
+    local lowerName = string.lower(modelName)
+    return (lowerName:find("mage") and lowerName:find("goblin")) or (lowerName:find("goblin") and lowerName:find("mage"))
+end
+
+local function isRangedOrc(modelName)
+    local lowerName = string.lower(modelName)
+    return (lowerName:find("range") or lowerName:find("arch")) and lowerName:find("orc")
+end
+
+local function getBossSafeConfig(model)
+    if isDemonKing(model.Name) then
+        return demonKingSafeAnimations, demonKingDangerKeywords
+    else
+        return bossSafeAnimations, bossDangerKeywords
+    end
+end
+
+local function isAnimationSafe(animName, model)
+    local safeAnimations, dangerKeywords = getBossSafeConfig(model)
+    local lowerName = string.lower(animName)
+    for _, danger in pairs(dangerKeywords) do
+        if string.find(lowerName, danger) then
+            return false
+        end
+    end
+    for _, safe in pairs(safeAnimations) do
+        if string.find(lowerName, safe) then
+            return true
+        end
+    end
+    return false
+end
+
+local function getRetreatDurationFromAnimation(animName)
+    animName = string.lower(animName or "")
+    if animName:find("skill1") or animName:find("skill2") or animName:find("skill3") or animName:find("skill4") or animName:find("skill5") then
+        return bossRetreatDurationSkill, "SKILL"
+    elseif animName:find("hit1") or animName:find("hit2") or animName:find("hit3") or animName:find("hit4") or animName:find("hit5") then
+        return bossRetreatDurationHit, "HIT"
+    end
+    return bossRetreatDurationDefault, "OTHER"
+end
+
+local function setupAnimationMonitor(model)
+    if animationMonitor[model] then
+        animationMonitor[model]:Disconnect()
+        animationMonitor[model] = nil
+    end
+
+    local hum = model:FindFirstChild("Humanoid")
+    if not hum then return end
+
+    if not isBoss(model.Name) then return end
+
+    animationMonitor[model] = hum.AnimationPlayed:Connect(function(track)
+        if not isRunning then return end
+
+        local animName = track.Name
+        local isSafe = isAnimationSafe(animName, model)
+
+        if not isSafe then
+            if not isRetreating then
+                local retreatDuration, reason = getRetreatDurationFromAnimation(animName)
+                isRetreating = true
+                StatusLabel:Set(
+                    "⚠️ BOSS SKILL: " .. animName ..
+                    "\n🏃 Type: " .. reason ..
+                    " - Escaping for " .. tostring(retreatDuration) .. "s..."
+                )
+                task.spawn(retreatMovementLoop, retreatDuration)
+            end
+        end
+    end)
+end
+
+local function clearAnimationMonitor(model)
+    if animationMonitor[model] then
+        animationMonitor[model]:Disconnect()
+        animationMonitor[model] = nil
+    end
+end
+
+local function startBossBackgroundMonitor()
+    if golemMonitorTask then task.cancel(golemMonitorTask) end
+    golemMonitorTask = task.spawn(function()
+        while isRunning do
+            for _, obj in pairs(workspace:GetDescendants()) do
+                if obj:IsA("Model") and obj:FindFirstChild("Humanoid") and obj:FindFirstChild("HumanoidRootPart") then
+                    if isBoss(obj.Name) and obj.Humanoid.Health > 0 then
+                        if not animationMonitor[obj] then
+                            setupAnimationMonitor(obj)
+                        end
+                    end
+                end
+            end
+            task.wait(1)
+        end
+    end)
+end
+
+local function startPriorityMonitor()
+    if priorityCheckTask then task.cancel(priorityCheckTask) end
+    priorityCheckTask = task.spawn(function()
+        while isRunning do
+            if currentTarget and currentTarget.Parent and currentTarget.Humanoid.Health > 0 then
+                local name = string.lower(currentTarget.Name)
+                if not isMageGoblin(name) and not isRangedOrc(name) then
+                    local closestPriority = nil
+                    local minDist = math.huge
+                    for _, obj in pairs(workspace:GetDescendants()) do
+                        if obj:IsA("Model") and obj ~= character and obj:FindFirstChild("Humanoid") and obj:FindFirstChild("HumanoidRootPart") then
+                            local h = obj.Humanoid
+                            if h.Health > 0 then
+                                local isPlayer = Players:GetPlayerFromCharacter(obj)
+                                if not isPlayer then
+                                    local n = obj.Name
+                                    if isMageGoblin(n) or isRangedOrc(n) then
+                                        local dist = (humanoidRootPart.Position - obj.HumanoidRootPart.Position).Magnitude
+                                        if dist < minDist then
+                                            minDist = dist
+                                            closestPriority = obj
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                    if closestPriority then
+                        currentTarget = closestPriority
+                        local typeStr = isMageGoblin(closestPriority.Name) and "Mage Goblin" or "Ranged Orc"
+                        StatusLabel:Set("🚨 PRIORITY SWITCH!\n🎯 " .. closestPriority.Name .. " [" .. typeStr .. "]")
+                        Rayfield:Notify({
+                            Title = "⚡ Priority Target Detected",
+                            Content = "Switching to " .. typeStr,
+                            Duration = 2,
+                            Image = 4483362458,
+                        })
+                    end
+                end
+            end
+            task.wait(1)
+        end
+    end)
+end
+
+function autoUltimateLoop()
+    if autoUltimateTask then task.cancel(autoUltimateTask) end
+    autoUltimateTask = task.spawn(function()
+        while isAutoUltimate and isRunning do
+            if not isRetreating and currentTarget and isBoss(currentTarget.Name) then
+                pressKey("G")
+                StatusLabel:Set("⚡ ULTIMATE ACTIVATED!")
+                task.wait(0.5)
+            end
+            task.wait(5)
+        end
+    end)
+end
+
+function emergencyEscape()
+    if safeModeCooldown then return end
+    safeModeCooldown = true
+    local originalTarget = currentTarget
+    isRetreating = true
+    StatusLabel:Set("🚨 EMERGENCY ESCAPE!\n⏱️ Safe for 30s...")
+    Rayfield:Notify({
+        Title = "⚠️ Safe Mode Activated",
+        Content = "Escaping for 30 seconds",
+        Duration = 3,
+        Image = 4483362458,
+    })
+    task.spawn(retreatMovementLoop, safeModeDuration)
+    task.wait(safeModeDuration)
+    isRetreating = false
+    safeModeCooldown = false
+    StatusLabel:Set("✅ Safe Mode Complete - Resuming")
+end
+
+function healthMonitorLoop()
+    if healthMonitorTask then task.cancel(healthMonitorTask) end
+    healthMonitorTask = task.spawn(function()
+        lastHealth = humanoid.Health
+        while isSafeMode and isRunning do
+            local currentHealth = humanoid.Health
+            local healthDrop = lastHealth - currentHealth
+            if currentHealth < safeModeHealthThreshold or healthDrop > safeModeHealthDrop then
+                emergencyEscape()
+            end
+            lastHealth = currentHealth
+            task.wait(0.5)
+        end
+    end)
+end
+
+local function attackCombo()
+    local bridgeNet = ReplicatedStorage:FindFirstChild("BridgeNet2")
+    if not bridgeNet then return end
+    local dataRemote = bridgeNet:WaitForChild("dataRemoteEvent")
+    while isRunning do
+        if not isRetreating then
+            for m = 1, damageMultiplier do
+                local args2 = { { { state = Enum.HumanoidStateType.Running, hitcount = 2 }, "\f" } }
+                pcall(function() dataRemote:FireServer(unpack(args2)) end)
+                local args3 = { { { state = Enum.HumanoidStateType.Running, hitcount = 3 }, "\f" } }
+                pcall(function() dataRemote:FireServer(unpack(args3)) end)
+                local args4 = { { { state = Enum.HumanoidStateType.Running, hitcount = 4 }, "\f" } }
+                pcall(function() dataRemote:FireServer(unpack(args4)) end)
+            end
+        end
+        task.wait(0.1)
+    end
+end
+
+local function isBlacklisted(npcName)
+    local lowerName = string.lower(npcName)
+    for _, blacklisted in pairs(blacklistedNames) do
+        if string.find(lowerName, blacklisted) then
+            return true
+        end
+    end
+    return false
+end
+
+-- ============  FIND BEST TARGET: PRIORITY MODE =================
+local function findBestTarget()
+    local priority1 = {} -- Mage Goblin หรือ Ranged Orc
+    local priority2 = {} -- Boss: Spider, Golem, Demon King
+    local priority3 = {} -- อื่นๆ ที่ไม่ได้ระบุ
+
+    for _, obj in pairs(workspace:GetDescendants()) do
+        if obj:IsA("Model") and obj ~= character and obj:FindFirstChild("Humanoid") and obj:FindFirstChild("HumanoidRootPart") then
+            local h = obj.Humanoid
+            if h.Health > 0 then
+                local isPlayer = Players:GetPlayerFromCharacter(obj)
+                if not isPlayer then
+                    local name = string.lower(obj.Name)
+                    if isBlacklisted(name) then
+                        continue
+                    end
+                    if isMageGoblin(name) or isRangedOrc(name) then
+                        table.insert(priority1, obj)
+                    elseif name:find("spider") or name:find("golem") or name:find("demon king") or name:find("demonking") then
+                        table.insert(priority2, obj)
+                    else
+                        table.insert(priority3, obj)
+                    end
+                end
+            end
+        end
+    end
+
+    local function getClosest(list)
+        local closest, minDist = nil, math.huge
+        for _, npc in pairs(list) do
+            local dist = (humanoidRootPart.Position - npc.HumanoidRootPart.Position).Magnitude
+            if dist < minDist then
+                minDist = dist
+                closest = npc
+            end
+        end
+        return closest
+    end
+
+    local target = getClosest(priority1)
+    if target then
+        local typename = isMageGoblin(target.Name) and "Mage Goblin" or "Ranged Orc"
+        return target, typename
+    end
+
+    target = getClosest(priority2)
+    if target then
+        local lname = string.lower(target.Name)
+        local tstr = "Boss"
+        if lname:find("spider") then tstr = "Spider (Boss)"
+        elseif lname:find("golem") then tstr = "Golem (Boss)"
+        elseif lname:find("demon king") or lname:find("demonking") then tstr = "Demon King (Boss)"
+        end
+        return target, tstr
+    end
+
+    target = getClosest(priority3)
+    if target then return target, "Other" end
+
+    return nil, "None"
+end
+
+local function calculateSafeHeight(model)
+    if not model then return 12 end
+    local size = model:GetExtentsSize()
+    local height = size.Y * 1.5
+    return math.clamp(height, 8, attackHeightMax)
+end
+
+local function startPositionLogic()
+    if floatConnection then floatConnection:Disconnect() end
+    local angle = 0
+    floatConnection = RunService.Heartbeat:Connect(function()
+        if not isRunning then return end
+        if not character or not humanoidRootPart then return end
+        local targetPos = nil
+        if currentTarget and currentTarget:FindFirstChild("HumanoidRootPart") then
+            local enemyRoot = currentTarget.HumanoidRootPart
+            local safeHeight = calculateSafeHeight(currentTarget)
+
+            if isRetreating then
+                targetPos = nil
+            else
+                local name = string.lower(currentTarget.Name)
+                local isRangedTarget = name:find("range") or name:find("mage")
+                if isRangedTarget then
+                    angle = angle + 0.1
+                    local radius = 8
+                    local offsetX = math.cos(angle) * radius
+                    local offsetZ = math.sin(angle) * radius
+                    targetPos = CFrame.new(enemyRoot.Position + Vector3.new(offsetX, safeHeight, offsetZ), enemyRoot.Position)
+                else
+                    targetPos = CFrame.new(enemyRoot.Position + Vector3.new(0, safeHeight, 0), enemyRoot.Position)
+                end
+            end
+        else
+            targetPos = CFrame.new(humanoidRootPart.Position)
+        end
+
+        if targetPos and not isRetreating then
+            humanoidRootPart.CFrame = targetPos
+            humanoidRootPart.Velocity = Vector3.new(0,0,0)
+        end
+    end)
+end
+
+local function manageHitAndRun()
+    if hitRunTask then task.cancel(hitRunTask) end
+    isRetreating = false
+    if not isHitAndRun or not currentTarget then return end
+    local hp = currentTarget.Humanoid.Health
+    if hp > hitRunHealthThreshold then
+        hitRunTask = task.spawn(function()
+            while isRunning and currentTarget and currentTarget.Humanoid.Health > 0 do
+                StatusLabel:Set("⚔️ Attacking (Hit & Run Mode)...")
+                isRetreating = false
+                task.wait(2.5)
+                if not isRunning or not currentTarget then break end
+                StatusLabel:Set("🏃 Retreating (Cooling down)...")
+                isRetreating = true
+                task.wait(1.5)
+            end
+            isRetreating = false
+        end)
+    end
+end
+
+function mainLoop()
+    startPositionLogic()
+    attackLoop = task.spawn(attackCombo)
+    startBossBackgroundMonitor()
+    startPriorityMonitor()
+    if isAutoSkill then autoSkillLoop() end
+    if isAutoUltimate then autoUltimateLoop() end
+    if isSafeMode then healthMonitorLoop() end
+    while isRunning do
+        if not currentTarget or not currentTarget.Parent or currentTarget.Humanoid.Health <= 0 then
+            if currentTarget then
+                if not isBoss(currentTarget.Name) then
+                    clearAnimationMonitor(currentTarget)
+                end
+            end
+            if hitRunTask then task.cancel(hitRunTask) end
+            isRetreating = false
+
+            local target, typeStr = findBestTarget()
+            if target then
+                currentTarget = target
+                StatusLabel:Set("🎯 LOCKED: " .. target.Name .. "\n[" .. typeStr .. "]")
+                if isBoss(target.Name) then
+                    setupAnimationMonitor(target)
+                end
+                manageHitAndRun()
+            else
+                StatusLabel:Set("🔍 Searching...")
+                currentTarget = nil
+            end
+        else
+            local name = string.lower(currentTarget.Name)
+            if not isMageGoblin(name) and not isRangedOrc(name) then
+                local priorityTarget, typename = findBestTarget()
+                if priorityTarget and (isMageGoblin(priorityTarget.Name) or isRangedOrc(priorityTarget.Name)) then
+                    if priorityTarget ~= currentTarget then
+                        currentTarget = priorityTarget
+                        StatusLabel:Set("🚨 PRIORITY SWITCH!\n🎯 " .. priorityTarget.Name .. " [" .. typename .. "]")
+                        Rayfield:Notify({
+                            Title = "⚡ Priority Target Detected",
+                            Content = "Switching to " .. typename,
+                            Duration = 2,
+                            Image = 4483362458,
+                        })
+                    end
+                end
+            end
+        end
+        task.wait(0.1)
+    end
+    stopAutoSkillLoop() -- ปิดลูปอัตโนมัติถ้า mainLoop จบ
+end
+
+function autoReplayLogic()
+    while isAutoReplay do
+        local gui = player:WaitForChild("PlayerGui")
+        for _, v in pairs(gui:GetDescendants()) do
+            if v:IsA("TextButton") and (string.find(string.lower(v.Name), "replay") or string.find(string.lower(v.Text), "replay")) then
+                if firesignal then firesignal(v.MouseButton1Click)
+                else for _, c in pairs(getconnections(v.MouseButton1Click)) do c:Fire() end end
+                task.wait(3)
+            end
+        end
+        task.wait(1)
+    end
+end
+
+humanoid.Died:Connect(function()
+    if isRunning then
+        task.wait(4)
+        updateCharacter()
+        lastHealth = humanoid.Health
+    end
+end)
+
+Rayfield:LoadConfiguration()
+print("✅ Anime Final Quest⚡ with Priority Monitor Loaded!")
